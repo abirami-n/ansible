@@ -38,28 +38,22 @@ from ansible.module_utils.netcfg import NetworkConfig, ConfigLine, ignore_line, 
 
 def get_config(module):
     contents = module.params['config']
-
     if not contents:
         contents = module.config.get_config()
         module.params['config'] = contents
-
-    return Dellos6NetworkConfig(indent=0, contents=contents[0])
-
+    return Dellos6NetworkConfig(indent=0, contents=contents)
 
 def get_sublevel_config(running_config, module):
     contents = list()
     current_config_contents = list()
     sublevel_config = Dellos6NetworkConfig(indent=0)
-
     obj = running_config.get_object(module.params['parents'])
     if obj:
         contents = obj.children
-
     for c in contents:
         if isinstance(c, ConfigLine):
             current_config_contents.append(c.raw)
     sublevel_config.add(current_config_contents, module.params['parents'])
-
     return sublevel_config
 
 
@@ -68,6 +62,7 @@ def os6_parse(lines, indent=None, comment_tokens=None):
         re.compile(r'^vlan.*$'),
         re.compile(r'^stack.*$'),
         re.compile(r'^interface.*$'),
+        re.compile(r'datacenter-bridging.*$'),
         re.compile(r'line (console|telnet|ssh).*$'),
         re.compile(r'ip ssh !(server).*$'),
         re.compile(r'ip (dhcp|vrf).*$'),
@@ -85,15 +80,18 @@ def os6_parse(lines, indent=None, comment_tokens=None):
         re.compile(r'banner motd.*$'),
         re.compile(r'openflow.*$'),
         re.compile(r'support-assist.*$'),
+        re.compile(r'template.*$'),
+        re.compile(r'address-family.*$'),
         re.compile(r'(radius-server|tacacs-server) host.*$')]
 
     childline = re.compile(r'^exit$')
-
     config = list()
     inSubLevel = False
     parent = None
     children = list()
-    subcommandcount = 0
+    inSubLevel_Next = False
+    next_parent = None
+    next_children = list()
 
     for line in str(lines).split('\n'):
         text = str(re.sub(r'([{};])', '', line)).strip()
@@ -107,7 +105,7 @@ def os6_parse(lines, indent=None, comment_tokens=None):
             inSubLevel = False
             continue
 
-        if inSubLevel is False:
+        if inSubLevel is False and inSubLevel_Next is False:
             for pr in sublevel_cmds:
                 if pr.match(line):
                     parent = cfg
@@ -117,22 +115,45 @@ def os6_parse(lines, indent=None, comment_tokens=None):
             if parent is None:
                 config.append(cfg)
 
-        # handle sub level commands
+        # handle sub level end 
         elif inSubLevel and childline.match(line):
             parent.children = children
             inSubLevel = False
             children = list()
             parent = None
+        
+        # handle second sublevel end
+        elif inSubLevel_Next and childline.match(line):
+            next_parent.children = next_children
+            config.append(cfg)
+            inSubLevel_Next = False
+            inSubLevel = True
+            next_children = list()
+            next_parent = None
 
-        # handle top level commands
+        # handle second sublevel commands
+        elif inSubLevel_Next:
+            next_children.append(cfg)
+            cfg.parents = [next_parent]
+            config.append(cfg)
+
+
+        # handle sub level commands
         elif inSubLevel:
             children.append(cfg)
             cfg.parents = [parent]
-            config.append(cfg)
+            for pr in sublevel_cmds:
+                if pr.match(line):
+                    next_parent = cfg
+                    config.append(next_parent)
+                    inSubLevel_Next = True
+                    inSubLevel = False
+                    continue
+            if next_parent is None:
+                config.append(cfg)
 
         else:  # global level
             config.append(cfg)
-
     return config
 
 
@@ -140,6 +161,15 @@ class Dellos6NetworkConfig(NetworkConfig):
 
     def load(self, contents):
         self._config = os6_parse(contents, self.indent, DEFAULT_COMMENT_TOKENS)
+
+    def diff_line(self, other, path=None):
+        diff = list()
+        for item in self.items:
+            if str(item) == "exit" and diff:
+                  diff.append(item)
+            if item not in other:
+                diff.append(item)
+        return diff
 
 
 class Cli(CliBase):
